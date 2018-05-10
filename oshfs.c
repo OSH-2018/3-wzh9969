@@ -1,5 +1,6 @@
 #define FUSE_USE_VERSION 26
 #include <string.h>
+#include <time.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <fuse.h>
@@ -13,7 +14,6 @@
 
 typedef struct filenode {
 	char *filename;
-	void *content;
 	int bnum;
 	struct stat *st;
 	struct filenode *next;
@@ -27,26 +27,36 @@ static const size_t size = SIZE;
 static void *mem[BLOCKNR];
 static const size_t blocksize = BLOCKSIZE;
 static const size_t blocknr = BLOCKNR;
-int pagenum = 0;
 static struct filenode *root = NULL;
+
+static int last_used_block = 0;
+struct information {
+	int blockused;
+	size_t size;
+	int filenum;
+	struct filenode *root;
+};
+struct information *info;
 
 int init_block(int blocknum)
 {
 	bhead *head;
 	if (mem[blocknum])
 		return -1;
+	info->blockused++;
 	mem[blocknum] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	memset(mem[blocknum], 0, blocksize);
 	head = (bhead*)mem[blocknum];
 	head->usedsize = sizeof(bhead);
 	head->nextblock = -1;
+	last_used_block = blocknum;
 	return 0;
 }
 /*find next available block*/
 int find_avail_block(void)
 {
-	int i = 0;
-	for (i = 0; i < BLOCKNR; i++)
+	int i;
+	for (i = (last_used_block + 1) % (int)blocknr; i != last_used_block; i = (i + 1) % (int)blocknr)
 		if (!mem[i])
 			return i;
 	return -1;
@@ -84,7 +94,6 @@ int setnext(int blocknum)
 	init_block(next);
 	head = (bhead*)mem[blocknum];
 	head->nextblock = next;
-	head->nextblock = BLOCKSIZE;
 	return next;
 }
 /*find a new block to create filenode*/
@@ -94,6 +103,7 @@ static void create_filenode(const char *filename, const struct stat *st)
 	bhead *head;
 	blocknum = find_avail_block();
 	init_block(blocknum);
+	info->filenum++;
 	head = (bhead*)mem[blocknum];
 	struct filenode *new = (struct filenode *)getmem(blocknum, sizeof(struct filenode));
 	new->filename = (char *)getmem(blocknum, strlen(filename) + 1);
@@ -101,32 +111,19 @@ static void create_filenode(const char *filename, const struct stat *st)
 	new->st = (struct stat *)getmem(blocknum, sizeof(struct stat));
 	memcpy(new->st, st, sizeof(struct stat));
 	new->next = root;
-	new->content = mem[blocknum] + head->usedsize;
 	new->bnum = blocknum;
 	root = new;
+	info->root = new;
 }
 
 static void *oshfs_init(struct fuse_conn_info *conn)
 {
-/*	size_t blocknr = sizeof(mem) / sizeof(mem[0]);
-	size_t blocksize = size / blocknr;
-	// Demo 1
-	for (int i = 0; i < blocknr; i++) {
-		mem[i] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		memset(mem[i], 0, blocksize);
-	}
-	for (int i = 0; i < blocknr; i++) {
-		munmap(mem[i], blocksize);
-	}
-	// Demo 2
-	mem[0] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	for (int i = 0; i < blocknr; i++) {
-		mem[i] = (char *)mem[0] + blocksize * i;
-		memset(mem[i], 0, blocksize);
-	}
-	for (int i = 0; i < blocknr; i++) {
-		munmap(mem[i], blocksize);
-	}*/
+	mem[0] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	info = (struct information*)mem[0];
+	info->blockused = 1;
+	info->filenum = 0;
+	info->size = 0;
+	info->root = NULL;
 	return NULL;
 }
 
@@ -167,6 +164,7 @@ static int oshfs_mknod(const char *path, mode_t mode, dev_t dev)
 	st.st_gid = fuse_get_context()->gid;
 	st.st_nlink = 1;
 	st.st_size = 0;
+	st.st_ctime = st.st_mtime = st.st_atime = time(NULL);
 	create_filenode(path + 1, &st);
 	return 0;
 }
@@ -181,7 +179,9 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
 	bhead *head;
 	size_t done;
 	struct filenode *node = get_filenode(path);
+	info->size += size + offset - node->st->st_size;
 	node->st->st_size = offset + size;
+	node->st->st_mtime = time(NULL);
 	int blocknum;
 	blocknum = node->bnum;
 	head = (bhead*)mem[blocknum];
@@ -211,7 +211,9 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
 static int oshfs_truncate(const char *path, off_t size)
 {
 	struct filenode *node = get_filenode(path);
+	info->size += size - node->st->st_size;
 	int blocknum = node->bnum;
+	node->st->st_mtime = time(NULL);
 	bhead *head = (bhead*)mem[blocknum];
 	node->st->st_size = size;
 	while (size > BLOCKSIZE - head->usedsize) {
@@ -228,7 +230,9 @@ static int oshfs_truncate(const char *path, off_t size)
 static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
 	struct filenode *node = get_filenode(path);
-	int ret = size, done;
+	node->st->st_atime = time(NULL);
+	int ret = size;
+	size_t done;
 	int blocknum = node->bnum;
 	bhead *head = (bhead*)mem[blocknum];
 	if (offset + size > node->st->st_size)
@@ -263,6 +267,7 @@ static int oshfs_unlink(const char *path)
 	if (strcmp(root->filename, path + 1) == 0) {
 		blocknum = root->bnum;
 		root = root->next;
+		info->root = root;
 	}
 	else {
 		while (node->next) {
@@ -280,11 +285,27 @@ static int oshfs_unlink(const char *path)
 	bhead* head = (bhead*)mem[blocknum];
 	int next = head->nextblock;
 	while (next != -1) {
+		info->size -= blocksize - head->usedsize;
 		munmap(mem[blocknum], BLOCKSIZE);
 		mem[blocknum] = NULL;
+		info->blockused--;
 		head = (bhead*)mem[next];
 		next = head->nextblock;
 	}
+	info->filenum--;
+	return 0;
+}
+static int oshfs_chmod(const char *path, mode_t mode) {
+	struct filenode *node = get_filenode(path);
+	node->st->st_mode = mode;
+	node->st->st_ctime = time(NULL);
+	return 0;
+}
+static int oshfs_chown(const char *path, uid_t uid, gid_t gid) {
+	struct filenode *node = get_filenode(path);
+	node->st->st_uid = uid;
+	node->st->st_gid = gid;
+	node->st->st_ctime = time(NULL);
 	return 0;
 }
 
@@ -298,6 +319,8 @@ static const struct fuse_operations op = {
 	.truncate = oshfs_truncate,
 	.read = oshfs_read,
 	.unlink = oshfs_unlink,
+	.chmod = oshfs_chmod,
+	.chown = oshfs_chown
 };
 
 int main(int argc, char *argv[])
