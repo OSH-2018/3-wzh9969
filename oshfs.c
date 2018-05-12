@@ -1,142 +1,248 @@
 #define FUSE_USE_VERSION 26
+#define test 0
+#if test
+#include <stdio.h>
+#endif
 #include <string.h>
 #include <time.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <fuse.h>
 #include <sys/mman.h>
+#include <stdlib.h>
 #define BLOCKSIZE (64 * 1024)
 #define SIZE ((size_t)4 * 1024 * 1024 * 1024)
 #define BLOCKNR ((SIZE) / (BLOCKSIZE))
 #define HEAD (sizeof(struct filenode))
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 
-
+typedef unsigned short int16;
 typedef struct filenode {
-	char *filename;
-	int bnum;
-	struct stat *st;
+	char filename[128];
+	/*for file it's the num of the first block, for dir it points to first file/dir belong to the dir*/
+	union fst {
+		int16 bhead; //file
+		struct filenode* pdir; //dir
+	}first;
+	/*for file it's the num of the last block, for dir it points to its father dir*/
+	union lst {
+		int16 lastblock; //file
+		struct filenode *father; //dir
+	}last;
+	struct stat st;
 	struct filenode *next;
 }fnode;
-typedef struct block_head {
-	int usedsize;
-	int nextblock;
-}bhead;
+
 
 static const size_t size = SIZE;
 static void *mem[BLOCKNR];
 static const size_t blocksize = BLOCKSIZE;
 static const size_t blocknr = BLOCKNR;
 static struct filenode *root = NULL;
+int maxfile;
+/*
+use static linklist to contain block info under the following rules:
+if (block is free) contains the num of the next free block or 0 if it's the last free block;
+else  contains the num of the next used block which belong to the same file or 0 if it's the last one;
+blocklist[0] contains the first free block;
+*/
+int16 *blocklist;
+fnode* freefile;
 
-static int last_used_block = 0;
-struct information {
-	int blockused;
-	size_t size;
-	int filenum;
-	struct filenode *root;
-};
-struct information *info;
 
-int init_block(int blocknum)
+int16 init_block(void)
 {
-	bhead *head;
+	int16 blocknum = blocklist[0];
+#if test
+	printf("init block %d\n", blocknum);
+#endif
 	if (mem[blocknum])
-		return -1;
-	info->blockused++;
+		return 0;
 	mem[blocknum] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	memset(mem[blocknum], 0, blocksize);
-	head = (bhead*)mem[blocknum];
-	head->usedsize = sizeof(bhead);
-	head->nextblock = -1;
-	last_used_block = blocknum;
-	return 0;
+	blocklist[0] = blocklist[blocknum];
+	blocklist[blocknum] = 0;
+	return blocknum;
 }
-/*find next available block*/
-int find_avail_block(void)
+/*get father by the path*/
+static struct filenode *get_father(const char *path)
 {
-	int i;
-	for (i = (last_used_block + 1) % (int)blocknr; i != last_used_block; i = (i + 1) % (int)blocknr)
-		if (!mem[i])
-			return i;
-	return -1;
-}
-/*get memory of size in the given block*/
-static void *getmem(int blocknum, int size)
-{
-	if (!mem[blocknum])
-		return NULL;
-	bhead *head = (bhead*)mem[blocknum];
-	if (size > BLOCKSIZE - head->usedsize)
-		size = size - head->usedsize;
-	head->usedsize += size;
-	return mem[blocknum] + head->usedsize - size;
-}
-/*get filenode by the filename*/
-static struct filenode *get_filenode(const char *name)
-{
+#if test
+	printf("finding father:%s\n",path);
+	printf("first free block:%u\n", blocklist[0]);
+#endif
 	struct filenode *node = root;
-	while (node) {
-		if (strcmp(node->filename, name + 1) != 0)
-			node = node->next;
-		else
+	char *name;
+	char *temp1, *temp2;
+	if (strcmp(path, "/") == 0)
+		return root;
+	name = (char*)malloc(sizeof(char)*(strlen(path) + 1));
+	memcpy(name, path, sizeof(char)*(strlen(path) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0') {
+			free(name);
 			return node;
+		}
+		if (*temp2 == '/') {
+			*temp2 = '\0';
+			node = node->first.pdir;
+#if test
+			printf("&&&%s&&&\n", node->filename);
+#endif
+			for (; node != NULL; node = node->next)
+				if (strcmp(temp1, node->filename) == 0)
+					break;
+			if (node == NULL)
+				return NULL;
+		}
 	}
 	return NULL;
 }
-/*find and init next available block*/
-int setnext(int blocknum)
-{
-	bhead *head;
-	int next = find_avail_block();
-	if (next == -1)
-		return -1;
-	init_block(next);
-	head = (bhead*)mem[blocknum];
-	head->nextblock = next;
-	return next;
-}
 /*find a new block to create filenode*/
-static void create_filenode(const char *filename, const struct stat *st)
+int create_filenode(const char *path, const struct stat *st)
 {
-	int blocknum;
-	bhead *head;
-	blocknum = find_avail_block();
-	init_block(blocknum);
-	info->filenum++;
-	head = (bhead*)mem[blocknum];
-	struct filenode *new = (struct filenode *)getmem(blocknum, sizeof(struct filenode));
-	new->filename = (char *)getmem(blocknum, strlen(filename) + 1);
-	memcpy(new->filename, filename, strlen(filename) + 1);
-	new->st = (struct stat *)getmem(blocknum, sizeof(struct stat));
-	memcpy(new->st, st, sizeof(struct stat));
-	new->next = root;
-	new->bnum = blocknum;
-	root = new;
-	info->root = new;
+#if test
+	printf("im creating filenode:%s\n",path);
+#endif
+	fnode *node, *father;
+	char *temp1, *temp2, *name;
+	node = freefile;
+	if (node == NULL)
+		return -1;
+	freefile = freefile->next;
+	father = get_father(path);
+	name = (char*)malloc(sizeof(char)*(strlen(path) + 1));
+	memcpy(name, path, sizeof(char)*(strlen(path) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
+		}
+	memcpy(node->filename, temp1, strlen(temp1));
+	if (st->st_mode&S_IFDIR == S_IFDIR) {
+#if test
+		printf("creating a dir\n");
+#endif
+		node->first.pdir = NULL;
+		node->last.father = father;
+	}
+	else {
+#if test
+		printf("creating a file\n");
+#endif
+		node->first.bhead = 0;
+		node->last.lastblock = 0;
+	}
+	memcpy(&node->st, st, sizeof(struct stat));
+	node->next = father->first.pdir;
+	father->first.pdir = node;
+	free(name);
+#if test
+	printf("done creating filenode:%s\n", root->first.pdir->filename);
+#endif
+	return 0;
 }
+
+/*get filenode by the path*/
+static struct filenode *get_filenode(const char *path)
+{
+#if test
+	printf("get filenode:%s\n", path);
+#endif
+	struct filenode *node;
+	if (strcmp(path, "/") == 0)
+		return root;
+	else {
+		node = get_father(path);
+#if test
+		printf("getfatherdone:%s\n", node->filename);
+#endif
+		node = node->first.pdir;
+	}
+	char *temp1, *temp2, *name;
+	name = malloc(sizeof(char)*(strlen(path) + 1));
+	memcpy(name, path, sizeof(char)*(strlen(path) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
+	}
+	while (node) {
+#if test
+		printf("%s:%s----------------------\n", node->filename, temp1);
+#endif
+		if (strcmp(node->filename, temp1) != 0)
+			node = node->next;
+		else {
+			free(name);
+			return node;
+		}
+	}
+#if test
+	printf("aaaaaaaaaaaaaaaaaaaaaa\n");
+#endif
+	free(name);
+	return NULL;
+}
+
 
 static void *oshfs_init(struct fuse_conn_info *conn)
 {
-	mem[0] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	info = (struct information*)mem[0];
-	info->blockused = 1;
-	info->filenum = 0;
-	info->size = 0;
-	info->root = NULL;
+#if test
+	printf("init\n");
+#endif
+	/*use mem[29:0] to contain file info*/
+	mem[0] = mmap(NULL, blocksize * 30, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	maxfile = 30 * blocksize / sizeof(fnode);
+	int i;
+	/*make mem[29:1] not NULL*/
+	for (i = 1; i < 30; i++)
+		mem[i] = mem[0];
+	freefile = (fnode*)mem[0];
+	for (i = 0; i < maxfile - 1; i++)
+		freefile[i].next = freefile + i + 1;
+	freefile[maxfile - 1].next = NULL;
+	/*use mem[31:30] to contain block info*/
+	mem[30] = mmap(NULL, blocksize * sizeof(int16), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	mem[31] = mem[30];
+	blocklist = (int16*)mem[30];
+	blocklist[0] = 32;
+	for (i = 1; i < blocksize - 1; i++)
+		blocklist[i] = i + 1;
+	blocklist[29] = 0;
+	blocklist[31] = 0;
+	blocklist[blocknr] = 0;
+	/*init dir "/"*/
+	root = freefile;
+	freefile = freefile->next;
+	memcpy(root->filename, "/", sizeof("/"));
+	root->first.pdir = NULL;
+	root->last.father = root;
+	root->next = NULL;
+	root->st.st_mode = 0755 | S_IFDIR;
+	root->st.st_atime = root->st.st_ctime = root->st.st_mtime = time(NULL);
+	root->st.st_uid = fuse_get_context()->uid;
+	root->st.st_gid = fuse_get_context()->gid;
+	root->st.st_nlink = 1;
+	root->st.st_size = sizeof(fnode);
 	return NULL;
 }
-
 static int oshfs_getattr(const char *path, struct stat *stbuf)
 {
+#if test
+	printf("getattr:%s\n", path);
+#endif
 	int ret = 0;
 	struct filenode *node = get_filenode(path);
-	if (strcmp(path, "/") == 0) {
-		memset(stbuf, 0, sizeof(struct stat));
-		stbuf->st_mode = S_IFDIR | 0755;
-	}
-	else if (node) {
-		memcpy(stbuf, node->st, sizeof(struct stat));
+	if (node) {
+		memcpy(stbuf, &node->st, sizeof(struct stat));
 	}
 	else {
 		ret = -ENOENT;
@@ -146,11 +252,16 @@ static int oshfs_getattr(const char *path, struct stat *stbuf)
 
 static int oshfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
-	struct filenode *node = root;
+#if test
+	printf("readdir:%s\n", path);
+#endif
+	struct filenode *node;
+	node = get_filenode(path);
 	filler(buf, ".", NULL, 0);
 	filler(buf, "..", NULL, 0);
+	node = node->first.pdir;
 	while (node) {
-		filler(buf, node->filename, node->st, 0);
+		filler(buf, node->filename, &node->st, 0);
 		node = node->next;
 	}
 	return 0;
@@ -158,169 +269,405 @@ static int oshfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
 
 static int oshfs_mknod(const char *path, mode_t mode, dev_t dev)
 {
+#if test
+	printf("mknod:%s\n", path);
+#endif
 	struct stat st;
-	st.st_mode = S_IFREG | 0644;
+	st.st_mode = mode | S_IFREG;
 	st.st_uid = fuse_get_context()->uid;
 	st.st_gid = fuse_get_context()->gid;
 	st.st_nlink = 1;
 	st.st_size = 0;
 	st.st_ctime = st.st_mtime = st.st_atime = time(NULL);
-	create_filenode(path + 1, &st);
+	create_filenode(path, &st);
+	return 0;
+}
+static int oshfs_mkdir(const char *path, mode_t mode)
+{
+#if test
+	printf("mkdir:%s\n", path);
+#endif
+	struct stat st;
+	st.st_mode = S_IFDIR | mode;
+	st.st_uid = fuse_get_context()->uid;
+	st.st_gid = fuse_get_context()->gid;
+	st.st_nlink = 1;
+	st.st_size = sizeof(fnode);
+	st.st_ctime = st.st_mtime = st.st_atime = time(NULL);
+	create_filenode(path, &st);
 	return 0;
 }
 
 static int oshfs_open(const char *path, struct fuse_file_info *fi)
 {
+#if test
+	printf("open %s\n", path);
+#endif
 	return 0;
 }
 
 static int oshfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-	bhead *head;
-	size_t done;
-	struct filenode *node = get_filenode(path);
-	info->size += size + offset - node->st->st_size;
-	node->st->st_size = offset + size;
-	node->st->st_mtime = time(NULL);
-	int blocknum;
-	blocknum = node->bnum;
-	head = (bhead*)mem[blocknum];
+#if test
+	printf("write:%s\n", path);
+#endif
+	size_t ret;
+	int16 blocknum;
+	fnode *node;
+	int temp;
+	node = get_filenode(path);
+	ret = node->st.st_size;
+	if (offset + size > node->st.st_size)
+		node->st.st_size = offset + size;
+	node->st.st_mtime = time(NULL);
 	/*find start address*/
-	while (offset > BLOCKSIZE - head->usedsize) {
-		offset -= BLOCKSIZE - head->usedsize;
-		if (head->nextblock == -1)
-			blocknum = setnext(blocknum);
-		else
-			blocknum = head->nextblock;
-		head = (bhead*)mem[blocknum];
+#if test
+	printf("offset  %ld,  comp  %ld\n", offset, ((ret + blocksize - 1) / blocksize - 1)*blocksize);
+#endif
+	if (offset >= ((ret + blocksize - 1) / blocksize - 1)*blocksize) {
+#if test
+		printf("use the last block!!\n");
+#endif
+		blocknum = node->last.lastblock;
+		offset -= ((ret + blocksize - 1) / blocksize - 1)*blocksize;
 	}
-	memcpy(mem[blocknum] + head->usedsize + offset, buf, min(size, BLOCKSIZE - head->usedsize - offset));
-	done = min(size, BLOCKSIZE - head->usedsize - offset);
-	while (done < size) {
-		if (head->nextblock == -1)
-			blocknum = setnext(blocknum);
-		else
-			blocknum = head->nextblock;
-		head = (bhead*)mem[blocknum];
-		memcpy(mem[blocknum] + head->usedsize, buf + done, min(size - done, BLOCKSIZE - head->usedsize));
-		done += min(size - done, BLOCKSIZE - head->usedsize);
+	else {
+		blocknum = node->first.bhead;
+		if (blocknum == 0) {
+			blocknum = init_block();
+			node->first.bhead = node->last.lastblock = blocknum;
+		}
 	}
-	return size;
+	ret = 0;
+#if test
+	printf("1  write start with block %u---offset %ld\n", blocknum, offset);
+#endif
+	while (offset >= blocksize) {
+		if (blocklist[blocknum] == 0) {
+			blocklist[blocknum] = init_block();
+			node->last.lastblock = blocklist[blocknum];
+		}
+		blocknum = blocklist[blocknum];
+		offset -= blocksize;
+	}
+	ret = min(blocksize - offset, size);
+	memcpy(mem[blocknum] + offset, buf, ret);
+	while (ret < size) {
+		if (blocklist[blocknum] == 0) {
+			blocklist[blocknum] = init_block();
+			node->last.lastblock = blocklist[blocknum];
+		}
+		blocknum = blocklist[blocknum];
+		if (blocknum == 0)
+			return ret;
+#if test
+		printf("2  write start with block %u---offset %ld\n", blocknum, offset);
+#endif
+		memcpy(mem[blocknum], buf + ret, min(blocksize, size - ret));
+		ret += min(blocksize, size - ret);
+	}
+#if test
+	printf("done: %ld\n", ret);
+#endif
+	return ret;
 }
-
+void free_block(int16 blocknum) {
+#if test
+	printf("free block %u\n", blocknum);
+#endif
+	int16 temp = blocklist[0];
+	blocklist[0] = blocknum;
+	munmap(mem[blocknum], blocksize);
+	mem[blocknum] = NULL;
+	while (blocklist[blocknum] != 0) {
+		blocknum = blocklist[blocknum];
+		munmap(mem[blocknum], blocksize);
+#if test
+		printf("free block %u\n", blocknum);
+#endif
+		mem[blocknum] = NULL;
+	}
+	blocklist[blocknum] = temp;
+}
 static int oshfs_truncate(const char *path, off_t size)
 {
+#if test
+	printf("truncate:%s -> %ld\n", path, size);
+#endif
 	struct filenode *node = get_filenode(path);
-	info->size += size - node->st->st_size;
-	int blocknum = node->bnum;
-	node->st->st_mtime = time(NULL);
-	bhead *head = (bhead*)mem[blocknum];
-	node->st->st_size = size;
-	while (size > BLOCKSIZE - head->usedsize) {
-		if (head->nextblock == -1)
-			blocknum = setnext(blocknum);
-		else
-			blocknum = head->nextblock;
-		size -= BLOCKSIZE - head->usedsize;
-		head = (bhead*)mem[blocknum];
+	node->st.st_size = size;
+	int16 blocknum = node->first.bhead;
+	while (size >= blocksize) {
+		if (blocklist[blocknum] == 0) {
+			blocklist[blocknum] = init_block();
+			node->last.lastblock = blocklist[blocknum];
+		}
+		blocknum = blocklist[blocknum];
+		size -= blocksize;
 	}
+	if (blocklist[blocknum] != 0) {
+		free_block(blocklist[blocknum]);
+		node->last.lastblock = blocknum;
+	}
+	blocklist[blocknum] = 0;
 	return 0;
 }
 
 static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
+#if test
+	printf("read:%s\n", path);
+#endif
 	struct filenode *node = get_filenode(path);
-	node->st->st_atime = time(NULL);
+	node->st.st_atime = time(NULL);
 	int ret = size;
 	size_t done;
-	int blocknum = node->bnum;
-	bhead *head = (bhead*)mem[blocknum];
-	if (offset + size > node->st->st_size)
-		ret = node->st->st_size - offset;
+	int16 blocknum = node->first.bhead;
+	if (offset + size > node->st.st_size)
+		ret = node->st.st_size - offset;
 	/*find start address*/
-	while (offset > BLOCKSIZE - head->usedsize) {
-		offset -= BLOCKSIZE - head->usedsize;
-		if (head->nextblock == -1)
+	while (offset > blocksize) {
+		offset -= blocksize;
+		if (blocklist[blocknum] == 0)
 			return -1;
 		else
-			blocknum = head->nextblock;
-		head = (bhead*)mem[blocknum];
+			blocknum = blocklist[blocknum];
 	}
-	memcpy(buf, mem[blocknum] + head->usedsize + offset, min(ret, BLOCKSIZE - head->usedsize - offset));
-	done = min(ret, BLOCKSIZE - head->usedsize - offset);
+#if test
+	printf("read block %u\n", blocknum);
+#endif
+	memcpy(buf, mem[blocknum] + offset, min(ret, blocksize - offset));
+	done = min(ret, blocksize - offset);
 	while (done < ret) {
-		if (head->nextblock == -1)
+		if (blocklist[blocknum] == 0)
 			return -1;
 		else
-			blocknum = head->nextblock;
-		head = (bhead*)mem[blocknum];
-		memcpy(buf + done, mem[blocknum] + head->usedsize, min(ret - done, BLOCKSIZE - head->usedsize));
-		done += min(ret - done, BLOCKSIZE - head->usedsize);
+			blocknum = blocklist[blocknum];
+#if test
+		printf("read block %u\n", blocknum);
+#endif
+		memcpy(buf + done, mem[blocknum], min(ret - done, blocksize));
+		done += min(ret - done, blocksize);
 	}
 	return ret;
 }
-
-static int oshfs_unlink(const char *path)
-{
-	struct filenode *node = root;
-	int blocknum = -1;
-	if (strcmp(root->filename, path + 1) == 0) {
-		blocknum = root->bnum;
-		root = root->next;
-		info->root = root;
+int rmfile(fnode *father, char *name) {
+	fnode *node, *temp;
+	node = father;
+	if (node == NULL)
+		return -1;
+	if (strcmp(node->first.pdir->filename, name) == 0) {
+		temp = node->first.pdir;
+		node->first.pdir = temp->next;
 	}
 	else {
-		while (node->next) {
-			if (strcmp(node->next->filename, path + 1) != 0)
+		node = node->first.pdir;
+		while (node->next != NULL) {
+			if (strcmp(node->next->filename, name) != 0)
 				node = node->next;
 			else {
-				blocknum = node->next->bnum;
-				node->next = node->next->next;
+				temp = node->next;
+				node->next = temp->next;
 				break;
 			}
 		}
 	}
-	if (blocknum == -1)
+	if (temp == NULL)
 		return -1;
-	bhead* head = (bhead*)mem[blocknum];
-	int next = head->nextblock;
-	while (next != -1) {
-		info->size -= blocksize - head->usedsize;
-		munmap(mem[blocknum], BLOCKSIZE);
-		mem[blocknum] = NULL;
-		info->blockused--;
-		head = (bhead*)mem[next];
-		next = head->nextblock;
+	free_block(temp->first.bhead);
+	memset(temp, 0, sizeof(fnode));
+	temp->next = freefile;
+	freefile = temp;
+	return 0;
+}
+static int oshfs_unlink(const char *path)
+{
+#if test
+	printf("unlink:%s\n", path);
+#endif
+	fnode *father = get_father(path);
+	char  *temp1, *temp2, *name;
+	name = (char*)malloc(sizeof(char)*(strlen(path) + 1));
+	memcpy(name, path, sizeof(char)*(strlen(path) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
 	}
-	info->filenum--;
+	int ret = rmfile(father, temp1);
+	free(name);
+	return ret;
+}
+/*rm all files and dirs in a dir*/
+int rmdir(fnode *father,char *name) {
+#if test
+	printf("start rmdir:%s\n", name);
+#endif
+	fnode *node, *temp;
+	node = father;
+	if (node == NULL)
+		return -1;
+	if (strcmp(node->first.pdir->filename, name) == 0) {
+		temp = node->first.pdir;
+		node->first.pdir = temp->next;
+	}
+	else {
+		node = node->first.pdir;
+		while (node->next != NULL) {
+			if (strcmp(node->next->filename, name) != 0)
+				node = node->next;
+			else {
+				temp = node->next;
+				node->next = temp->next;
+				break;
+			}
+		}
+	}
+	if (temp == NULL)
+		return -1;
+	memset(temp, 0, sizeof(fnode));
+	temp->next = freefile;
+	freefile = temp;
 	return 0;
 }
-static int oshfs_chmod(const char *path, mode_t mode) {
+static int oshfs_rmdir(const char *path)
+{
+#if test
+	printf("rmdir:%s\n", path);
+#endif
+	fnode  *father;
+	father = get_father(path);
+	if (father == NULL)
+		return -1;
+	char  *temp1, *temp2, *name;
+	name = (char*)malloc(sizeof(char)*(strlen(path) + 1));
+	memcpy(name, path, sizeof(char)*(strlen(path) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
+	}
+#if test
+	printf("---------------rmdir %s,%s\n", father->filename, temp1);
+#endif
+	int ret = rmdir(father, temp1);
+	free(name);
+	return ret;
+}
+static int oshfs_rename(const char *old_p, const char *new_p)
+{
+#if test
+	printf("rename:%s -> %s\n", old_p, new_p);
+#endif
+	fnode *father, *node;
+	fnode *temp;
+	father = get_father(old_p);
+	node = father;
+	if (node == NULL)
+		return -1;
+	char  *temp1, *temp2, *name;
+	name = (char*)malloc(sizeof(char)*(strlen(old_p) + 1));
+	memcpy(name, old_p, sizeof(char)*(strlen(old_p) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
+	}
+	if (strcmp(node->first.pdir->filename, temp1) == 0) {
+		temp = node->first.pdir;
+		node->first.pdir = temp->next;
+	}
+	else {
+		node = node->first.pdir;
+		while (node->next != NULL) {
+			if (strcmp(node->next->filename, temp1) != 0)
+				node = node->next;
+			else {
+				temp = node->next;
+				node->next = temp->next;
+				break;
+			}
+		}
+	}
+	if (temp == NULL)
+		return -1;
+	free(name);
+	node = get_filenode(new_p);
+	if (node != NULL)
+		return -1;
+#if test
+	printf("find old file:%s\n", temp->filename);
+#endif
+	name = (char*)malloc(sizeof(char)*(strlen(new_p) + 1));
+	memcpy(name, new_p, sizeof(char)*(strlen(new_p) + 1));
+	for (temp1 = name, temp2 = temp1; temp2 != '\0'; temp1 = temp2) {
+		temp1++;
+		for (temp2 = temp1 + 1; *temp2 != '/'&&*temp2 != '\0'; temp2++)
+			;
+		if (*temp2 == '\0')
+			break;
+	}
+	memcpy(temp->filename, temp1, sizeof(char)*(strlen(temp1) + 1));
+#if test
+	printf("change to new file:%s\n", temp->filename);
+#endif
+	father = get_father(new_p);
+	temp->next = father->first.pdir;
+	father->first.pdir = temp;
+	free(name);
+	return 0;
+}
+
+
+static int oshfs_chmod(const char *path, mode_t mode) 
+{
 	struct filenode *node = get_filenode(path);
-	node->st->st_mode = mode;
-	node->st->st_ctime = time(NULL);
+	node->st.st_mode = mode;
+	node->st.st_ctime = time(NULL);
 	return 0;
 }
-static int oshfs_chown(const char *path, uid_t uid, gid_t gid) {
+static int oshfs_chown(const char *path, uid_t uid, gid_t gid) 
+{
 	struct filenode *node = get_filenode(path);
-	node->st->st_uid = uid;
-	node->st->st_gid = gid;
-	node->st->st_ctime = time(NULL);
+	node->st.st_uid = uid;
+	node->st.st_gid = gid;
+	node->st.st_ctime = time(NULL);
 	return 0;
 }
+
+static int oshfs_utimens(const char *path, const struct timespec tv[2])
+{
+	struct filenode *node = get_filenode(path);
+	node->st.st_atim.tv_nsec = tv[0].tv_nsec;
+	node->st.st_atim.tv_sec = tv[0].tv_sec;
+	node->st.st_mtim.tv_nsec = tv[1].tv_nsec;
+	node->st.st_mtim.tv_sec = tv[1].tv_sec;
+	return 0;
+}
+
 
 static const struct fuse_operations op = {
 	.init = oshfs_init,
 	.getattr = oshfs_getattr,
 	.readdir = oshfs_readdir,
 	.mknod = oshfs_mknod,
+	.mkdir = oshfs_mkdir,
 	.open = oshfs_open,
 	.write = oshfs_write,
 	.truncate = oshfs_truncate,
 	.read = oshfs_read,
 	.unlink = oshfs_unlink,
+	.rmdir = oshfs_rmdir,
+	.rename = oshfs_rename,
 	.chmod = oshfs_chmod,
-	.chown = oshfs_chown
+	.chown = oshfs_chown,
+	.utimens = oshfs_utimens
 };
 
 int main(int argc, char *argv[])
