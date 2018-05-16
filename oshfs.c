@@ -292,16 +292,12 @@ static void *oshfs_init(struct fuse_conn_info *conn)
 	mem[0] = mmap(NULL, blocksize * 30, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	maxfile = 30 * blocksize / sizeof(fnode);
 	int i;
-	/*make mem[29:1] not NULL*/
-	for (i = 1; i < 30; i++)
-		mem[i] = mem[0];
 	freefile = (fnode*)mem[0];
 	for (i = 0; i < maxfile - 1; i++)
 		freefile[i].next = freefile + i + 1;
 	freefile[maxfile - 1].next = NULL;
 	/*use mem[31:30] to contain block info*/
 	mem[30] = mmap(NULL, blocksize * sizeof(int16), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	mem[31] = mem[30];
 	blocklist = (int16*)mem[30];
 	blocklist[0] = 32;
 	for (i = 1; i < blocksize - 1; i++)
